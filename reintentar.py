@@ -37,6 +37,33 @@ def log(texto: str) -> None:
     print(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] {texto}", flush=True)
 
 
+_chequeo = {"id": None}
+
+
+def publicar(rondas: int, ultimo: str, terminado: bool = False) -> None:
+    """Deja el avance en un "check run" público ("estado") que se lee en vivo con la API de GitHub sin llave:
+    título "<rondas> rondas", resumen con la hora y la última respuesta de Oracle."""
+    repo, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
+    if not repo or not token:
+        return
+    datos = {"output": {"title": f"{rondas} rondas",
+                        "summary": f"{datetime.datetime.now(datetime.UTC):%Y-%m-%dT%H:%M:%SZ} {ultimo}"}}
+    if terminado:
+        datos |= {"status": "completed", "conclusion": "success"}
+    if _chequeo["id"]:
+        url, metodo = f"https://api.github.com/repos/{repo}/check-runs/{_chequeo['id']}", "PATCH"
+    else:
+        url, metodo = f"https://api.github.com/repos/{repo}/check-runs", "POST"
+        datos |= {"name": "estado", "head_sha": os.environ["GITHUB_SHA"], "status": "in_progress"}
+    peticion = urllib.request.Request(url, json.dumps(datos).encode(), method=metodo, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(peticion, timeout=20) as r:
+            _chequeo["id"] = json.load(r)["id"]
+    except Exception as e:
+        log(f"No pude publicar el avance: {type(e).__name__}")
+
+
 def avisar(texto: str) -> None:
     datos = urllib.parse.urlencode({"chat_id": os.environ["TELEGRAM_CHAT"], "text": texto}).encode()
     url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_TOKEN']}/sendMessage"
@@ -98,6 +125,7 @@ def main() -> int:
     log("Empiezo a reintentar")
     if vm_existente():
         log("La VM ya existe; no hay nada que hacer")
+        publicar(0, "la VM ya existe", terminado=True)
         return 3
     ad = identidad.list_availability_domains(TENANCY).data[0].name
     ronda = 0
@@ -113,22 +141,29 @@ def main() -> int:
                         continue
                     if e.status == 429:
                         log("Oracle pide calma (429); espero más")
+                        publicar(ronda, "Oracle pide calma (429)")
                         time.sleep(300)
                         break
                     if e.code == "LimitExceeded":
                         log("Límite de la cuenta excedido")
+                        publicar(ronda, "detenido: límite de la cuenta excedido", terminado=True)
                         avisar("Lukas, el reintento de la VM de Oracle (GitHub) se detuvo: Oracle dice que se "
                                "excede el límite gratuito. Abre Claude Code para revisarlo.")
                         return 3
                     raise
+                publicar(ronda, f"VM creada ({ocpus} OCPU / {memoria} GB)", terminado=True)
                 terminar(instancia, ocpus, memoria)
                 return 3
-            if ronda % 20 == 1:
-                log(f"Ronda {ronda}: sin capacidad todavía")
+            else:
+                if ronda % 20 == 1:
+                    log(f"Ronda {ronda}: sin capacidad todavía")
+                publicar(ronda, "sin capacidad")
         except Exception as e:
             log(f"Error en la ronda {ronda}: {type(e).__name__}: {getattr(e, 'status', '')} {getattr(e, 'code', '')}")
+            publicar(ronda, f"error {type(e).__name__} {getattr(e, 'status', '')}".strip())
         time.sleep(ESPERA + random.randint(0, 60))
     log(f"Fin de esta tanda ({ronda} rondas); sigue la próxima")
+    publicar(ronda, "fin de la tanda; sigue la próxima", terminado=True)
     return 0
 
 
