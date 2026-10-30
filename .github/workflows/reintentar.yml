@@ -1,0 +1,57 @@
+name: Reintentar VM de Oracle
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"  # respaldo por si se corta la cadena
+
+concurrency:
+  group: reintento
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  reintentar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet oci
+      - name: Reintentar
+        id: reintento
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
+          SSH_PUB: ${{ secrets.SSH_PUB }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+        run: |
+          umask 077
+          printf '%s\n' "$OCI_KEY" > "$RUNNER_TEMP/oci.pem"
+          export OCI_KEY_FILE="$RUNNER_TEMP/oci.pem"
+          set +e
+          python reintentar.py
+          echo "codigo=$?" >> "$GITHUB_OUTPUT"
+          rm -f "$RUNNER_TEMP/oci.pem"
+      - name: Siguiente tanda
+        if: steps.reintento.outputs.codigo == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run reintentar.yml --repo "$GITHUB_REPOSITORY"
+      - name: Listo, apagar el flujo
+        if: steps.reintento.outputs.codigo == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable reintentar.yml --repo "$GITHUB_REPOSITORY"
+      - name: Falló (retoma el horario de respaldo)
+        if: steps.reintento.outputs.codigo != '0' && steps.reintento.outputs.codigo != '3'
+        run: exit 1
