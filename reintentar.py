@@ -1,7 +1,9 @@
 """Reintenta crear una VM Always Free de Oracle (A1.Flex) hasta que haya capacidad, en GitHub Actions.
 
 Todo lo de la cuenta llega por variables de entorno (secretos del repositorio). Cada ejecución dura ~5 h 50 min
-y el flujo se relanza solo. Al conseguir la VM avisa por Telegram y apaga el flujo.
+y el flujo se relanza solo. Prueba la grande (2 OCPU / 12 GB) y, si no hay, la chica (1 / 6). Si sale la chica,
+avisa por Telegram y sigue buscando una grande aparte ("viernes-grande"; las dos caben en el plan gratis) para
+mudarse a ella sin cortar el servicio. Con la grande, avisa y apaga el flujo.
 """
 import datetime
 import json
@@ -15,7 +17,7 @@ import urllib.request
 import oci
 
 NOMBRE = "viernes"
-FORMAS = [(2, 12), (1, 6)]  # se prueba la grande y, si no hay, la chica
+NOMBRE_GRANDE = "viernes-grande"  # si sale la chica, se sigue buscando una grande aparte (caben las dos gratis)
 ESPERA = 180  # segundos entre rondas (más un poco al azar)
 DURACION = 5 * 3600 + 50 * 60  # GitHub corta los trabajos a las 6 h
 
@@ -83,11 +85,21 @@ def imagen() -> str:
     return imgs[0].id
 
 
-def vm_existente():
-    for i in compute.list_instances(compartment_id=TENANCY, display_name=NOMBRE).data:
+def vm_existente(nombre: str):
+    for i in compute.list_instances(compartment_id=TENANCY, display_name=nombre).data:
         if i.lifecycle_state not in ("TERMINATED", "TERMINATING"):
             return i
     return None
+
+
+def que_falta() -> list[tuple[str, int, int]]:
+    """Las VM que se prueban en cada ronda, en orden: (nombre, OCPU, GB). Vacía si ya hay una grande."""
+    chica, grande = vm_existente(NOMBRE), vm_existente(NOMBRE_GRANDE)
+    if grande or (chica and chica.shape_config.ocpus >= 2):
+        return []
+    if chica:
+        return [(NOMBRE_GRANDE, 2, 12)]
+    return [(NOMBRE, 2, 12), (NOMBRE, 1, 6)]
 
 
 def ip_publica(instancia) -> str | None:
@@ -101,9 +113,9 @@ def ip_publica(instancia) -> str | None:
     return None
 
 
-def lanzar(ad: str, ocpus: int, memoria: int, id_imagen: str):
+def lanzar(ad: str, nombre: str, ocpus: int, memoria: int, id_imagen: str):
     detalles = oci.core.models.LaunchInstanceDetails(
-        compartment_id=TENANCY, availability_domain=ad, display_name=NOMBRE,
+        compartment_id=TENANCY, availability_domain=ad, display_name=nombre,
         shape="VM.Standard.A1.Flex",
         shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memoria),
         source_details=oci.core.models.InstanceSourceViaImageDetails(image_id=id_imagen, boot_volume_size_in_gbs=50),
@@ -112,30 +124,41 @@ def lanzar(ad: str, ocpus: int, memoria: int, id_imagen: str):
     return compute.launch_instance(detalles).data
 
 
-def terminar(instancia, ocpus: int, memoria: int) -> None:
-    ip = ip_publica(instancia)
-    log(f"VM creada ({ocpus} OCPU / {memoria} GB)")  # la IP no va al log público
-    avisar(f"Lukas, conseguí el servidor de Oracle: {ocpus} procesadores y {memoria} gigas, "
-           f"IP {ip or 'pendiente'}. Abre Claude Code para configurarlo.")
+def terminar(instancia, nombre: str, ocpus: int, memoria: int) -> None:
+    ip = ip_publica(instancia) or "pendiente"
+    log(f"VM {nombre} creada ({ocpus} OCPU / {memoria} GB)")  # la IP no va al log público
+    if nombre == NOMBRE_GRANDE:
+        avisar(f"Lukas, conseguí la VM grande de Oracle: {ocpus} procesadores y {memoria} gigas, IP {ip}. "
+               "La chica sigue funcionando; abre Claude Code para mudar V.I.E.R.N.E.S. a la grande y borrar la chica.")
+    elif ocpus < 2:
+        avisar(f"Lukas, conseguí el servidor de Oracle, la versión chica: {ocpus} procesador y {memoria} gigas, "
+               f"IP {ip}. Abre Claude Code para configurarlo. Sigo intentando la grande desde GitHub.")
+    else:
+        avisar(f"Lukas, conseguí el servidor de Oracle: {ocpus} procesadores y {memoria} gigas, IP {ip}. "
+               "Abre Claude Code para configurarlo.")
 
 
 def main() -> int:
     """0: sigue mañana (otra ejecución); 3: listo o detenido (apagar el flujo)."""
     inicio = time.monotonic()
     log("Empiezo a reintentar")
-    if vm_existente():
-        log("La VM ya existe; no hay nada que hacer")
-        publicar(0, "la VM ya existe", terminado=True)
+    if not que_falta():
+        log("La VM grande ya existe; no hay nada que hacer")
+        publicar(0, "la VM grande ya existe", terminado=True)
         return 3
     ad = identidad.list_availability_domains(TENANCY).data[0].name
     ronda = 0
     while time.monotonic() - inicio < DURACION:
         ronda += 1
         try:
+            # Se mira en cada ronda qué existe: si algo falla tras crear una VM, no se pide otra igual.
+            if not (formas := que_falta()):
+                publicar(ronda, "la VM grande ya existe", terminado=True)
+                return 3
             id_imagen = imagen()
-            for ocpus, memoria in FORMAS:
+            for nombre, ocpus, memoria in formas:
                 try:
-                    instancia = lanzar(ad, ocpus, memoria, id_imagen)
+                    instancia = lanzar(ad, nombre, ocpus, memoria, id_imagen)
                 except oci.exceptions.ServiceError as e:
                     if "capacity" in e.message.lower():
                         continue
@@ -151,13 +174,17 @@ def main() -> int:
                                "excede el límite gratuito. Abre Claude Code para revisarlo.")
                         return 3
                     raise
-                publicar(ronda, f"VM creada ({ocpus} OCPU / {memoria} GB)", terminado=True)
-                terminar(instancia, ocpus, memoria)
+                terminar(instancia, nombre, ocpus, memoria)
+                if nombre == NOMBRE and ocpus < 2:
+                    publicar(ronda, "VM chica creada (1 OCPU / 6 GB); sigo buscando la grande")
+                    break
+                publicar(ronda, f"VM grande creada ({ocpus} OCPU / {memoria} GB)", terminado=True)
                 return 3
             else:
                 if ronda % 20 == 1:
                     log(f"Ronda {ronda}: sin capacidad todavía")
-                publicar(ronda, "sin capacidad")
+                publicar(ronda, "sin capacidad" if formas[0][0] == NOMBRE
+                         else "VM chica lista; sin capacidad para la grande")
         except Exception as e:
             log(f"Error en la ronda {ronda}: {type(e).__name__}: {getattr(e, 'status', '')} {getattr(e, 'code', '')}")
             publicar(ronda, f"error {type(e).__name__} {getattr(e, 'status', '')}".strip())
